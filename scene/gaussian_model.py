@@ -50,6 +50,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._temperature = torch.empty((0, 1))
+        self._temperature_gradient = torch.empty((0, 3))
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -72,9 +74,12 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._temperature,
+            self._temperature_gradient,
         )
     
     def restore(self, model_args, training_args):
+        thermal_args = model_args[12:]  # Older checkpoints have twelve fields.
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -86,7 +91,9 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = model_args[:12]
+        self.set_temperature(thermal_args[0] if thermal_args else 20.0,
+                             thermal_args[1] if len(thermal_args) > 1 else None)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -103,6 +110,34 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    @property
+    def get_temperature(self):
+        return self._temperature
+
+    @property
+    def get_temperature_gradient(self):
+        return self._temperature_gradient
+
+    def set_temperature(self, temperature=20.0, gradient=None):
+        """Set passive physical attributes; they are not optimizer parameters."""
+        n = self._xyz.shape[0]
+        values = torch.as_tensor(temperature, dtype=self._xyz.dtype, device=self._xyz.device)
+        if values.numel() == 1:
+            values = values.expand(n).reshape(n, 1)
+        elif values.numel() == n:
+            values = values.reshape(n, 1)
+        else:
+            raise ValueError("temperature must contain one value per Gaussian")
+        if not torch.isfinite(values).all():
+            raise ValueError("Gaussian temperature must be finite")
+        grads = torch.zeros((n, 3), dtype=self._xyz.dtype, device=self._xyz.device)
+        if gradient is not None:
+            grads = torch.as_tensor(gradient, dtype=self._xyz.dtype, device=self._xyz.device)
+            if grads.shape != (n, 3) or not torch.isfinite(grads).all():
+                raise ValueError("temperature gradient must have shape (n_gaussians, 3)")
+        self._temperature = values.detach().clone()
+        self._temperature_gradient = grads.detach().clone()
     
     @property
     def get_features(self):
@@ -145,6 +180,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.set_temperature()
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -186,6 +222,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        l += ['temperature', 'temperature_gradient_x', 'temperature_gradient_y', 'temperature_gradient_z']
         return l
 
     def save_ply(self, path):
@@ -202,7 +239,10 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        temperature = self._temperature.detach().cpu().numpy()
+        gradient = self._temperature_gradient.detach().cpu().numpy()
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation,
+                                     temperature, gradient), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -212,7 +252,7 @@ class GaussianModel:
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def load_ply(self, path):
+    def load_ply(self, path, device="cuda"):
         plydata = PlyData.read(path)
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
@@ -246,12 +286,18 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device=device).requires_grad_(True))
+        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device=device).transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device=device).transpose(1, 2).contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device=device).requires_grad_(True))
+        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device=device).requires_grad_(True))
+        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device=device).requires_grad_(True))
+
+        names = {p.name for p in plydata.elements[0].properties}
+        temperatures = np.asarray(plydata.elements[0]['temperature']) if 'temperature' in names else 20.0
+        gradient_names = ['temperature_gradient_' + axis for axis in 'xyz']
+        gradients = np.stack([np.asarray(plydata.elements[0][name]) for name in gradient_names], axis=1) if all(name in names for name in gradient_names) else None
+        self.set_temperature(temperatures, gradients)
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -290,6 +336,8 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        self._temperature = self._temperature[valid_points_mask]
+        self._temperature_gradient = self._temperature_gradient[valid_points_mask]
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -326,7 +374,14 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                              new_temperature=None, new_temperature_gradient=None):
+        if new_temperature is None:
+            new_temperature = torch.full((new_xyz.shape[0], 1), 20.0, device=new_xyz.device)
+        if new_temperature_gradient is None:
+            new_temperature_gradient = torch.zeros((new_xyz.shape[0], 3), device=new_xyz.device)
+        self._temperature = torch.cat((self._temperature, new_temperature.detach()), dim=0)
+        self._temperature_gradient = torch.cat((self._temperature_gradient, new_temperature_gradient.detach()), dim=0)
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -342,9 +397,9 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self._xyz.device)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -366,7 +421,13 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        new_temperature = self._temperature[selected_pts_mask].repeat(N, 1)
+        new_gradient = self._temperature_gradient[selected_pts_mask].repeat(N, 1)
+        offsets = new_xyz - self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_temperature = new_temperature + (offsets * new_gradient).sum(dim=1, keepdim=True)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation,
+                                  new_temperature, new_gradient)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -384,7 +445,8 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                                  self._temperature[selected_pts_mask], self._temperature_gradient[selected_pts_mask])
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
